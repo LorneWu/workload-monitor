@@ -3,6 +3,10 @@
 # -> SynoUpdate -> BuildAll) stage by stage. Requires `monitor` and `stage`
 # binaries on PATH (see README for build/install instructions), and a
 # root/sudo-capable account for the DSM build tooling itself.
+#
+# monitor writes samples.report.md itself when killed at the end — no
+# separate `report` step needed unless you want to compare against another
+# machine's run afterward (see README's "Compare two runs").
 set -u
 PDIR=/synosrc/YOUR_PROJECT_DIR
 BRANCH=your-branch
@@ -12,7 +16,7 @@ PROJ=your-project
 OUTDIR=~/workload-monitor-run-$(date +%Y%m%d-%H%M%S)
 mkdir -p "$OUTDIR"
 SAMPLES="$OUTDIR/samples.csv"
-EVENTS="$OUTDIR/events.csv"
+EVENTS="$OUTDIR/samples.csv.events.csv"
 
 PWFILE="$HOME/.buildpw_tmp"   # write your sudo password here, mode 600, once
 PW=$(cat "$PWFILE")
@@ -27,9 +31,9 @@ cleanup_tree() {
 
 # Start the sampler in the background. -iface/-disk auto-detect if omitted;
 # pass them explicitly if auto-detection picks the wrong NIC/disk on your box.
-monitor -out "$SAMPLES" &
+monitor -out "$SAMPLES" -label "$(hostname)" &
 MONITOR_PID=$!
-trap 'kill $MONITOR_PID 2>/dev/null' EXIT
+trap 'kill $MONITOR_PID 2>/dev/null; wait $MONITOR_PID 2>/dev/null' EXIT
 
 cleanup_tree
 
@@ -62,7 +66,11 @@ S ./BuildAll -UF -p "$PLATFORM" "$PROJ"
 stage "$EVENTS" end BuildAll
 
 kill "$MONITOR_PID" 2>/dev/null
+wait "$MONITOR_PID" 2>/dev/null
 trap - EXIT
 
-echo "Done. Report with:"
-echo "  report -samples $SAMPLES -events $EVENTS"
+echo "Done. Report: $OUTDIR/samples.report.md"
+echo "To compare against another machine's run of this same script:"
+echo "  report -samples <thisdir>/samples.csv -events <thisdir>/samples.csv.events.csv \\"
+echo "         -samples2 <otherdir>/samples.csv -events2 <otherdir>/samples.csv.events.csv \\"
+echo "         -label1 \$(hostname) -label2 <other-hostname> -out comparison.md"

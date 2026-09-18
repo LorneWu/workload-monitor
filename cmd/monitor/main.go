@@ -2,6 +2,11 @@
 // and frequency counters at a fixed interval and writes them as CSV — one
 // process, no subprocess forking, so the sampler's own footprint stays
 // negligible even across a many-hour run.
+//
+// When stopped with SIGINT/SIGTERM (a plain `kill`, or Ctrl-C) and -out
+// points at a file, it automatically writes a per-stage avg/max Markdown
+// report next to it — no separate manual `report` invocation needed for
+// the common single-run case.
 package main
 
 import (
@@ -9,16 +14,24 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"os/signal"
+	"path/filepath"
+	"strings"
+	"syscall"
 	"time"
 
 	"github.com/LorneWu/workload-monitor/internal/procfs"
+	"github.com/LorneWu/workload-monitor/internal/report"
 )
 
 func main() {
 	iface := flag.String("iface", "", "network interface to sample (default: auto-detect default route interface)")
 	disk := flag.String("disk", "", "block device to sample, e.g. sda (default: auto-detect first physical disk)")
 	interval := flag.Duration("interval", 2*time.Second, "sampling interval")
-	out := flag.String("out", "", "output CSV path (default: stdout)")
+	out := flag.String("out", "", "output CSV path (default: stdout; required for auto-report on exit)")
+	events := flag.String("events", "", "stage event CSV written by `stage` (default: <out>.events.csv if -out is set)")
+	reportPath := flag.String("report", "", "Markdown report path written on exit (default: <out-without-ext>.report.md if -out is set)")
+	label := flag.String("label", "", "label for this run in the auto-generated report (default: hostname)")
 	flag.Parse()
 
 	if *iface == "" {
@@ -46,6 +59,21 @@ func main() {
 		}
 		defer f.Close()
 		w = f
+
+		if *events == "" {
+			*events = *out + ".events.csv"
+		}
+		if *reportPath == "" {
+			ext := filepath.Ext(*out)
+			*reportPath = strings.TrimSuffix(*out, ext) + ".report.md"
+		}
+		if *label == "" {
+			if h, err := os.Hostname(); err == nil {
+				*label = h
+			} else {
+				*label = "run"
+			}
+		}
 	}
 
 	fmt.Fprintln(w, "epoch,cpu_pct,cpu_user_pct,cpu_iowait_pct,cpu_core_max_pct,load1,"+
@@ -68,72 +96,129 @@ func main() {
 	ticker := time.NewTicker(*interval)
 	defer ticker.Stop()
 
-	for range ticker.C {
-		now := time.Now()
-		elapsed := now.Sub(prevTime).Seconds()
-		if elapsed <= 0 {
-			elapsed = float64(*interval) / float64(time.Second)
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+
+loop:
+	for {
+		select {
+		case <-sigCh:
+			break loop
+		case <-ticker.C:
+			now := time.Now()
+			elapsed := now.Sub(prevTime).Seconds()
+			if elapsed <= 0 {
+				elapsed = float64(*interval) / float64(time.Second)
+			}
+
+			agg, cores, err := procfs.ReadCPUStat()
+			if err != nil {
+				continue
+			}
+			cpuPct, userPct, iowaitPct := cpuPercents(prevAgg, agg)
+			coreMaxPct := maxCorePct(prevCores, cores)
+
+			load1, _ := procfs.LoadAvg1()
+
+			mem, _ := procfs.ReadMemInfo()
+			memUsedMB := float64(mem.TotalKB-mem.AvailableKB) / 1024
+			memAvailMB := float64(mem.AvailableKB) / 1024
+			swapUsedMB := float64(mem.SwapTotalKB-mem.SwapFreeKB) / 1024
+			dirtyMB := float64(mem.DirtyKB) / 1024
+			writebackMB := float64(mem.WritebackKB) / 1024
+
+			vm, _ := procfs.ReadVMStat()
+			swapInKBps := float64(vm.PSwpIn-prevVM.PSwpIn) * 4 / elapsed // page size 4KB on x86_64
+			swapOutKBps := float64(vm.PSwpOut-prevVM.PSwpOut) * 4 / elapsed
+
+			net, _ := procfs.ReadNetDev(*iface)
+			rxKBps := float64(net.RxBytes-prevNet.RxBytes) / 1024 / elapsed
+			txKBps := float64(net.TxBytes-prevNet.TxBytes) / 1024 / elapsed
+
+			retrans, _ := procfs.ReadTCPRetrans()
+			retransPs := float64(retrans-prevRetrans) / elapsed
+
+			ds, _ := procfs.ReadDiskStats(*disk)
+			readKBps := float64(ds.SectorsRead-prevDisk.SectorsRead) * 512 / 1024 / elapsed
+			writeKBps := float64(ds.SectorsWritten-prevDisk.SectorsWritten) * 512 / 1024 / elapsed
+			utilPct := float64(ds.TimeIOMs-prevDisk.TimeIOMs) / (elapsed * 1000) * 100
+			if utilPct > 100 {
+				utilPct = 100
+			}
+			diskIOs := (ds.ReadsCompleted - prevDisk.ReadsCompleted) + (ds.WritesCompleted - prevDisk.WritesCompleted)
+			diskTimeMs := (ds.TimeReadingMs - prevDisk.TimeReadingMs) + (ds.TimeWritingMs - prevDisk.TimeWritingMs)
+			var awaitMs float64
+			if diskIOs > 0 {
+				awaitMs = float64(diskTimeMs) / float64(diskIOs)
+			}
+
+			tempC, _ := procfs.MaxThermalC()
+			freqMHz, _ := procfs.AvgCPUFreqMHz()
+
+			fmt.Fprintf(w, "%d,%.1f,%.1f,%.1f,%.1f,%.2f,%.0f,%.0f,%.0f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.0f\n",
+				now.Unix(), cpuPct, userPct, iowaitPct, coreMaxPct, load1,
+				memUsedMB, memAvailMB, swapUsedMB, swapInKBps, swapOutKBps, dirtyMB, writebackMB,
+				rxKBps, txKBps, retransPs,
+				readKBps, writeKBps, utilPct, awaitMs,
+				tempC, freqMHz)
+			_ = w.Sync()
+
+			prevAgg, prevCores = agg, cores
+			prevNet = net
+			prevDisk = ds
+			prevVM = vm
+			prevRetrans = retrans
+			prevTime = now
 		}
-
-		agg, cores, err := procfs.ReadCPUStat()
-		if err != nil {
-			continue
-		}
-		cpuPct, userPct, iowaitPct := cpuPercents(prevAgg, agg)
-		coreMaxPct := maxCorePct(prevCores, cores)
-
-		load1, _ := procfs.LoadAvg1()
-
-		mem, _ := procfs.ReadMemInfo()
-		memUsedMB := float64(mem.TotalKB-mem.AvailableKB) / 1024
-		memAvailMB := float64(mem.AvailableKB) / 1024
-		swapUsedMB := float64(mem.SwapTotalKB-mem.SwapFreeKB) / 1024
-		dirtyMB := float64(mem.DirtyKB) / 1024
-		writebackMB := float64(mem.WritebackKB) / 1024
-
-		vm, _ := procfs.ReadVMStat()
-		swapInKBps := float64(vm.PSwpIn-prevVM.PSwpIn) * 4 / elapsed // page size 4KB on x86_64
-		swapOutKBps := float64(vm.PSwpOut-prevVM.PSwpOut) * 4 / elapsed
-
-		net, _ := procfs.ReadNetDev(*iface)
-		rxKBps := float64(net.RxBytes-prevNet.RxBytes) / 1024 / elapsed
-		txKBps := float64(net.TxBytes-prevNet.TxBytes) / 1024 / elapsed
-
-		retrans, _ := procfs.ReadTCPRetrans()
-		retransPs := float64(retrans-prevRetrans) / elapsed
-
-		ds, _ := procfs.ReadDiskStats(*disk)
-		readKBps := float64(ds.SectorsRead-prevDisk.SectorsRead) * 512 / 1024 / elapsed
-		writeKBps := float64(ds.SectorsWritten-prevDisk.SectorsWritten) * 512 / 1024 / elapsed
-		utilPct := float64(ds.TimeIOMs-prevDisk.TimeIOMs) / (elapsed * 1000) * 100
-		if utilPct > 100 {
-			utilPct = 100
-		}
-		diskIOs := (ds.ReadsCompleted - prevDisk.ReadsCompleted) + (ds.WritesCompleted - prevDisk.WritesCompleted)
-		diskTimeMs := (ds.TimeReadingMs - prevDisk.TimeReadingMs) + (ds.TimeWritingMs - prevDisk.TimeWritingMs)
-		var awaitMs float64
-		if diskIOs > 0 {
-			awaitMs = float64(diskTimeMs) / float64(diskIOs)
-		}
-
-		tempC, _ := procfs.MaxThermalC()
-		freqMHz, _ := procfs.AvgCPUFreqMHz()
-
-		fmt.Fprintf(w, "%d,%.1f,%.1f,%.1f,%.1f,%.2f,%.0f,%.0f,%.0f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.0f\n",
-			now.Unix(), cpuPct, userPct, iowaitPct, coreMaxPct, load1,
-			memUsedMB, memAvailMB, swapUsedMB, swapInKBps, swapOutKBps, dirtyMB, writebackMB,
-			rxKBps, txKBps, retransPs,
-			readKBps, writeKBps, utilPct, awaitMs,
-			tempC, freqMHz)
-		_ = w.Sync()
-
-		prevAgg, prevCores = agg, cores
-		prevNet = net
-		prevDisk = ds
-		prevVM = vm
-		prevRetrans = retrans
-		prevTime = now
 	}
+
+	if *out == "" {
+		return // nothing to report from stdout-only mode
+	}
+	_ = w.Sync()
+	_ = w.Close()
+
+	writeAutoReport(*out, *events, *reportPath, *label)
+}
+
+// writeAutoReport generates the single-run Markdown report on exit. If the
+// events file doesn't exist yet (the caller never called `stage`), it
+// treats the whole run as one implicit stage so the report still has
+// something useful in it instead of failing.
+func writeAutoReport(samplesPath, eventsPath, reportPath, label string) {
+	samples, cols, err := report.LoadSamples(samplesPath)
+	if err != nil {
+		log.Printf("auto-report: load samples: %v", err)
+		return
+	}
+	if len(samples) == 0 {
+		log.Printf("auto-report: no samples collected, skipping report")
+		return
+	}
+
+	var stages []report.StageWindow
+	if _, err := os.Stat(eventsPath); err == nil {
+		stages, err = report.LoadStages(eventsPath)
+		if err != nil {
+			log.Printf("auto-report: load stages: %v", err)
+		}
+	}
+	if len(stages) == 0 {
+		stages = []report.StageWindow{{
+			Name:       "whole-run",
+			StartEpoch: samples[0].Epoch,
+			EndEpoch:   samples[len(samples)-1].Epoch,
+		}}
+	}
+
+	f, err := os.Create(reportPath)
+	if err != nil {
+		log.Printf("auto-report: create %s: %v", reportPath, err)
+		return
+	}
+	defer f.Close()
+	report.WriteSingleRun(f, label, samples, cols, stages)
+	log.Printf("report written to %s", reportPath)
 }
 
 // cpuPercents returns (busy%, user+system%, iowait%) between two aggregate

@@ -18,7 +18,11 @@ Design goals, in order:
    `/proc` and `/sys` directly every tick — it never forks a subprocess
    (no `awk`, `ps`, `date`, etc. per sample). Safe to leave running for a
    multi-hour build without meaningfully affecting the numbers it's
-   measuring.
+   measuring. Measured: over a 30s window at the default 2s interval,
+   `monitor` itself consumed **0.02s of CPU time total (~0.07% average)**
+   and **~5.5MB RSS**. Reproduce with `/proc/<pid>/stat` field 14+15 (utime+stime)
+   deltas and `/proc/<pid>/status`'s `VmRSS`, same as any other process —
+   nothing special is done to hide the tool's own cost.
 2. **No install step on the target machine.** `monitor`/`stage`/`report`
    are static binaries — `scp` and run. No Python/awk version concerns, no
    package installs on machines you don't control.
@@ -26,7 +30,11 @@ Design goals, in order:
    `SynoUpdate`, `BuildAll`, or anything else) with `stage <events.csv>
    start|end <name>`; `report` correlates those markers against the
    sampler's timeline automatically.
-4. **Cross-machine comparison built in.** `report -samples2 ... -events2
+4. **Report generation is automatic.** `kill`ing `monitor` (or Ctrl-C) makes
+   it write a per-stage avg/max Markdown report on its own — no separate
+   manual `report` invocation needed for a single run. `report` itself
+   still exists for regenerating a report later, or for comparing two runs.
+5. **Cross-machine comparison built in.** `report -samples2 ... -events2
    ...` prints a side-by-side table, not just two separate reports you have
    to diff yourself.
 
@@ -73,39 +81,46 @@ scp monitor stage user@target:~/
 ## Usage
 
 Start the sampler (auto-detects the default-route interface and the first
-physical disk if you don't pass `-iface`/`-disk`):
+physical disk if you don't pass `-iface`/`-disk`; when `-out` is a file,
+the events and report paths default to `<out>.events.csv` and
+`<out-without-ext>.report.md`, so passing just `-out` is enough):
 
 ```bash
-./monitor -out samples.csv &
+./monitor -out samples.csv -label $(hostname) &
 MONITOR_PID=$!
 ```
 
-Bracket each phase of your workload:
+Bracket each phase of your workload (writes to `samples.csv.events.csv` by
+default — pass `-events` to `monitor` explicitly if you want a different
+path):
 
 ```bash
-./stage events.csv start BaseAll
+./stage samples.csv.events.csv start BaseAll
 ./BaseAll -f -p epyc7003ntb
-./stage events.csv end BaseAll
+./stage samples.csv.events.csv end BaseAll
 
-./stage events.csv start BuildAll
+./stage samples.csv.events.csv start BuildAll
 ./BuildAll -UF -p epyc7003ntb linux-5.10.x
-./stage events.csv end BuildAll
+./stage samples.csv.events.csv end BuildAll
 ```
 
-Stop the sampler, then report:
+Stop the sampler — it writes `samples.report.md` itself before exiting:
 
 ```bash
 kill $MONITOR_PID
-./report -samples samples.csv -events events.csv
+wait $MONITOR_PID
+cat samples.report.md
 ```
 
 Compare two runs (e.g. two different machines that both ran
-`examples/dsm-build.sh`):
+`examples/dsm-build.sh`) by feeding both runs' raw CSVs to `report`
+directly — the per-run auto-report from each machine is just a preview,
+this is the side-by-side:
 
 ```bash
-./report -samples hostA/samples.csv -events hostA/events.csv \
-          -samples2 hostB/samples.csv -events2 hostB/events.csv \
-          -label1 hostA -label2 hostB
+./report -samples hostA/samples.csv -events hostA/samples.csv.events.csv \
+          -samples2 hostB/samples.csv -events2 hostB/samples.csv.events.csv \
+          -label1 hostA -label2 hostB -out comparison.md
 ```
 
 See `examples/dsm-build.sh` for a full worked example (a DSM `BaseAll` /
@@ -118,7 +133,10 @@ See `examples/dsm-build.sh` for a full worked example (a DSM `BaseAll` /
 | `-iface` | auto-detect (default route interface) | network interface to sample |
 | `-disk` | auto-detect (first non-loop/ram/dm/sr block device) | block device to sample |
 | `-interval` | `2s` | sampling interval |
-| `-out` | stdout | output CSV path |
+| `-out` | stdout | output CSV path. Required for auto-report on exit — stdout-only runs skip it. |
+| `-events` | `<out>.events.csv` | where `stage` markers are read from when generating the auto-report |
+| `-report` | `<out-without-ext>.report.md` | where the auto-report is written on exit |
+| `-label` | hostname | label used for this run in the auto-report |
 
 ## `report` flags
 
@@ -127,3 +145,4 @@ See `examples/dsm-build.sh` for a full worked example (a DSM `BaseAll` /
 | `-samples`, `-events` | first (or only) run's files |
 | `-samples2`, `-events2` | second run's files — presence of both enables comparison mode |
 | `-label1`, `-label2` | labels for the two runs in comparison output (default `run1`/`run2`) |
+| `-out` | output path (default: stdout) |
