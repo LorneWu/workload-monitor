@@ -7,6 +7,7 @@ import (
 	"bufio"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 )
@@ -327,12 +328,77 @@ func DefaultInterface() (string, bool) {
 	return "", false
 }
 
-// DefaultDisk makes a best-effort guess at the primary physical block
-// device by picking the first entry under /sys/block that looks like a
-// real disk (skips loop devices, ram disks, and device-mapper/LVM nodes —
-// diskstats accounting for the physical device underneath is what actually
-// reflects hardware I/O).
+// DefaultDisk finds the physical block device that actually backs "/", by
+// reading /proc/mounts for the root filesystem's source device and, if
+// that's an LVM/device-mapper node, resolving through
+// /sys/block/<dm>/slaves/ down to the real disk underneath.
+//
+// This deliberately does NOT just pick "the first non-loop/dm entry under
+// /sys/block" — on a machine with more than one physical disk (e.g. a spare
+// NVMe alongside the SATA disk actually hosting the filesystem being
+// profiled), alphabetical or directory-order picking can silently choose
+// the wrong, idle device and report all-zero disk I/O for an entire run.
 func DefaultDisk() (string, bool) {
+	dev, ok := rootMountSource()
+	if !ok {
+		return firstPhysicalBlockDevice()
+	}
+	name := filepath.Base(dev)
+	// Resolve dm-N (LVM, luks, etc.) down to the underlying physical device.
+	for i := 0; i < 5; i++ { // bounded in case of unexpected nesting
+		slaves, err := os.ReadDir("/sys/block/" + name + "/slaves")
+		if err != nil || len(slaves) == 0 {
+			break
+		}
+		name = slaves[0].Name()
+	}
+	// Strip a trailing partition number (sda3 -> sda, nvme0n1p3 -> nvme0n1)
+	// if /sys/block has the whole-disk entry but not the partition itself.
+	if _, err := os.Stat("/sys/block/" + name); err != nil {
+		name = stripPartitionSuffix(name)
+	}
+	if _, err := os.Stat("/sys/block/" + name); err != nil {
+		return firstPhysicalBlockDevice()
+	}
+	return name, true
+}
+
+// rootMountSource returns the device field for the "/" entry in
+// /proc/mounts.
+func rootMountSource() (string, bool) {
+	f, err := os.Open("/proc/mounts")
+	if err != nil {
+		return "", false
+	}
+	defer f.Close()
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		fields := strings.Fields(sc.Text())
+		if len(fields) < 2 || fields[1] != "/" {
+			continue
+		}
+		if !strings.HasPrefix(fields[0], "/dev/") {
+			return "", false
+		}
+		// /dev/mapper/foo is a symlink to the real /dev/dm-N node.
+		if resolved, err := filepath.EvalSymlinks(fields[0]); err == nil {
+			return resolved, true
+		}
+		return fields[0], true
+	}
+	return "", false
+}
+
+var partitionSuffix = regexp.MustCompile(`(p?\d+)$`)
+
+func stripPartitionSuffix(name string) string {
+	return partitionSuffix.ReplaceAllString(name, "")
+}
+
+// firstPhysicalBlockDevice is the fallback used when /proc/mounts can't be
+// read or resolved: the first /sys/block entry that isn't a loop device,
+// ram disk, device-mapper node, or optical drive.
+func firstPhysicalBlockDevice() (string, bool) {
 	entries, err := os.ReadDir("/sys/block")
 	if err != nil {
 		return "", false
