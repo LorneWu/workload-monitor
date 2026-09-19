@@ -57,7 +57,9 @@ Design goals, in order:
 | `disk_util_pct` | % of the sample interval the disk had at least one I/O in flight |
 | `disk_await_ms` | average time per I/O request — a better "is the disk the bottleneck" signal than throughput, since a saturated queue can still show OK throughput while every request waits |
 | `temp_c` | hottest reading across every `/sys/class/thermal/thermal_zone*` — thermal throttling is invisible to every other metric here, and was the actual root cause the last time this mattered |
-| `cpu_freq_mhz` | average current CPU clock — a low reading under high load is the direct fingerprint of thermal/power throttling |
+| `cpu_freq_mhz` | average current CPU clock |
+| `cpu_freq_pct_of_max` | `cpu_freq_mhz` as a % of the machine's rated `cpuinfo_max_freq`. The cross-vendor throttle signal: this sitting low while `cpu_pct`/`cpu_core_max_pct` are high (i.e. the CPU wants to run but isn't) is the fingerprint of thermal or power throttling. Works on any CPU, including AMD where `throttle_core_ps`/`throttle_package_ps` below aren't available. |
+| `throttle_core_ps` / `throttle_package_ps` | Intel-only: cumulative `thermal_throttle` events/sec from `/sys/devices/system/cpu/cpuN/thermal_throttle/`, i.e. the CPU *itself* reporting "I just throttled" — a direct signal, not an inference from frequency. **Always 0 on AMD (and some VMs/containers) because the counter doesn't exist there, not because throttling didn't happen** — `monitor` logs at startup whether this host supports it; check that log line before trusting a run of zeros as "no throttling." Use `cpu_freq_pct_of_max` instead on those hosts. |
 
 ## Build
 

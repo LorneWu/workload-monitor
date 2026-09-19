@@ -301,6 +301,55 @@ func AvgCPUFreqMHz() (float64, bool) {
 	return sum / float64(n), true
 }
 
+// CPUMaxFreqMHz reads the hardware's rated maximum frequency
+// (cpuinfo_max_freq, static for the machine's lifetime) from cpu0. Compared
+// against AvgCPUFreqMHz, this is the reference point for spotting
+// throttling on ANY vendor: actual frequency sitting well below this while
+// cpu_pct is high is the cross-platform tell, needed on AMD where
+// ThrottleCounts below isn't available.
+func CPUMaxFreqMHz() (float64, bool) {
+	b, err := os.ReadFile("/sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq")
+	if err != nil {
+		return 0, false
+	}
+	khz, err := strconv.ParseFloat(strings.TrimSpace(string(b)), 64)
+	if err != nil {
+		return 0, false
+	}
+	return khz / 1000.0, true
+}
+
+// ThrottleCounts reads Intel's cumulative thermal-throttle event counters
+// from /sys/devices/system/cpu/cpuN/thermal_throttle/ — core_throttle_count
+// summed across all cores, package_throttle_count from cpu0 (package-wide,
+// identical across cores so one read suffices). This is a DIRECT signal
+// ("the CPU itself reports it throttled N times"), not an inference from
+// frequency — far more conclusive than watching AvgCPUFreqMHz dip.
+//
+// This interface is Intel-specific; AMD exposes no equivalent standard
+// sysfs counter. ok=false means "unsupported on this CPU," never "zero
+// throttle events" — callers must not treat it as a clean bill of health.
+func ThrottleCounts() (coreCount, packageCount int64, ok bool) {
+	entries, err := filepath.Glob("/sys/devices/system/cpu/cpu[0-9]*/thermal_throttle/core_throttle_count")
+	if err != nil || len(entries) == 0 {
+		return 0, 0, false
+	}
+	for _, p := range entries {
+		b, err := os.ReadFile(p)
+		if err != nil {
+			continue
+		}
+		n, err := strconv.ParseInt(strings.TrimSpace(string(b)), 10, 64)
+		if err == nil {
+			coreCount += n
+		}
+	}
+	if pb, err := os.ReadFile("/sys/devices/system/cpu/cpu0/thermal_throttle/package_throttle_count"); err == nil {
+		packageCount, _ = strconv.ParseInt(strings.TrimSpace(string(pb)), 10, 64)
+	}
+	return coreCount, packageCount, true
+}
+
 // DefaultInterface makes a best-effort guess at the primary network
 // interface by reading the default route from /proc/net/route (the
 // interface whose destination is 0.0.0.0).

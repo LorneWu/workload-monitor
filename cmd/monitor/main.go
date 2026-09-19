@@ -80,8 +80,16 @@ func main() {
 		"mem_used_mb,mem_avail_mb,swap_used_mb,swap_in_kBps,swap_out_kBps,dirty_mb,writeback_mb,"+
 		"net_rx_kBps,net_tx_kBps,tcp_retrans_ps,"+
 		"disk_read_kBps,disk_write_kBps,disk_util_pct,disk_await_ms,"+
-		"temp_c,cpu_freq_mhz")
+		"temp_c,cpu_freq_mhz,cpu_freq_pct_of_max,throttle_core_ps,throttle_package_ps")
 	_ = w.Sync()
+
+	cpuMaxFreq, hasMaxFreq := procfs.CPUMaxFreqMHz()
+	_, _, hasThrottleCounters := procfs.ThrottleCounts()
+	if hasThrottleCounters {
+		log.Print("Intel thermal_throttle counters available — throttle_core_ps/throttle_package_ps are a direct signal")
+	} else {
+		log.Print("no thermal_throttle counters on this CPU (expected on AMD) — rely on cpu_freq_pct_of_max under high cpu_pct as the throttle signal instead")
+	}
 
 	prevAgg, prevCores, err := procfs.ReadCPUStat()
 	if err != nil {
@@ -91,6 +99,7 @@ func main() {
 	prevDisk, _ := procfs.ReadDiskStats(*disk)
 	prevVM, _ := procfs.ReadVMStat()
 	prevRetrans, _ := procfs.ReadTCPRetrans()
+	prevCoreThrottle, prevPackageThrottle, _ := procfs.ThrottleCounts()
 	prevTime := time.Now()
 
 	ticker := time.NewTicker(*interval)
@@ -154,13 +163,21 @@ loop:
 
 			tempC, _ := procfs.MaxThermalC()
 			freqMHz, _ := procfs.AvgCPUFreqMHz()
+			var freqPctOfMax float64
+			if hasMaxFreq && cpuMaxFreq > 0 {
+				freqPctOfMax = freqMHz / cpuMaxFreq * 100
+			}
 
-			fmt.Fprintf(w, "%d,%.1f,%.1f,%.1f,%.1f,%.2f,%.0f,%.0f,%.0f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.0f\n",
+			coreThrottle, packageThrottle, _ := procfs.ThrottleCounts()
+			throttleCorePs := float64(coreThrottle-prevCoreThrottle) / elapsed
+			throttlePackagePs := float64(packageThrottle-prevPackageThrottle) / elapsed
+
+			fmt.Fprintf(w, "%d,%.1f,%.1f,%.1f,%.1f,%.2f,%.0f,%.0f,%.0f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.0f,%.1f,%.2f,%.2f\n",
 				now.Unix(), cpuPct, userPct, iowaitPct, coreMaxPct, load1,
 				memUsedMB, memAvailMB, swapUsedMB, swapInKBps, swapOutKBps, dirtyMB, writebackMB,
 				rxKBps, txKBps, retransPs,
 				readKBps, writeKBps, utilPct, awaitMs,
-				tempC, freqMHz)
+				tempC, freqMHz, freqPctOfMax, throttleCorePs, throttlePackagePs)
 			_ = w.Sync()
 
 			prevAgg, prevCores = agg, cores
@@ -168,6 +185,7 @@ loop:
 			prevDisk = ds
 			prevVM = vm
 			prevRetrans = retrans
+			prevCoreThrottle, prevPackageThrottle = coreThrottle, packageThrottle
 			prevTime = now
 		}
 	}
